@@ -80,6 +80,24 @@ https://subscription-patch-worker.ACCOUNT.workers.dev/config?token=YOUR_ACCESS_T
 默认透传客户端 User-Agent。可选的 UPSTREAM_USER_AGENT 可固定上游请求标识。
 当前每个 Worker 使用一个上游地址；上游需要按客户端返回相应格式，本工具不进行跨格式转换。
 
+## 错误排查
+
+失败响应正文为 `错误码: 提示`，响应头 `X-Error-Code` 提供相同错误码，不返回订阅 URL、凭据或上游正文。
+
+| 错误码                                                  | 检查方向                                                 |
+| ------------------------------------------------------- | -------------------------------------------------------- |
+| INVALID_UPSTREAM_URL                                    | UPSTREAM_URL 必须为 HTTPS，不能内嵌用户名密码（503）     |
+| UPSTREAM_HTTP_ERROR                                     | 提示中包含上游 HTTP 状态码，例如 403（502）              |
+| UPSTREAM_REDIRECT                                       | 使用最终订阅地址，不自动跟随跳转（502）                  |
+| UPSTREAM_TIMEOUT                                        | 上游请求或读取超过 20 秒（504）                          |
+| UPSTREAM_FETCH_FAILED                                   | Worker 到上游的网络连接或响应读取失败（502）             |
+| UPSTREAM_EMPTY / UPSTREAM_TOO_LARGE / UPSTREAM_ENCODING | 上游为空、超过 5 MiB 或非 UTF-8（502）                   |
+| UPSTREAM_PARSE_ERROR / UNSUPPORTED_FORMAT               | 上游不是可解析的完整 sing-box / Mihomo 配置（502）       |
+| INVALID_OVERRIDE / MERGE_FAILED                         | 检查对应覆盖文件、tag、新增条目的 type 和配置结构（500） |
+
+浏览器访问时，上游可能按浏览器 User-Agent 返回网页或节点列表。若希望固定获取 sing-box 配置，可设置普通变量 `UPSTREAM_USER_AGENT=sing-box/1.14.0`，然后重试。
+Mihomo YAML 覆盖文件仅在处理 Mihomo 订阅时解析；JSON 覆盖文件的语法错误会在构建时失败。
+
 ## 开发
 
 ```sh
@@ -113,7 +131,7 @@ pnpm exec wrangler secret put ACCESS_TOKEN
 - 未知或混合格式拒绝处理，不支持 Base64 节点列表。
 - 仅验证合并所需结构，不替代代理内核的完整配置检查。
 - 请求设有 20 秒超时和 5 MiB 流式大小限制；上游必须 HTTPS，不跟随跳转。
-- 响应禁止缓存，token 不传给上游；上游失败时返回通用 502，不存储旧订阅。
+- 响应禁止缓存，token 不传给上游；失败时返回安全的错误码和提示，不存储旧订阅。
 - 原型相关危险键拒绝合并，YAML 禁止重复键并限制别名展开。
 
 ## 后续规划

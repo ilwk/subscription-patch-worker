@@ -1,4 +1,5 @@
 import { transform } from "./adapters";
+import { SubscriptionError } from "./errors";
 export interface Env {
   UPSTREAM_URL: string;
   ACCESS_TOKEN: string;
@@ -36,7 +37,11 @@ async function authorized(request: Request, env: Env) {
   }
 }
 async function readBody(r: Response) {
-  if (!r.body) throw new Error("Empty body");
+  if (!r.body)
+    throw new SubscriptionError(
+      "UPSTREAM_EMPTY",
+      "Upstream returned an empty body.",
+    );
   const reader = r.body.getReader(),
     decoder = new TextDecoder("utf-8", { fatal: true });
   let size = 0,
@@ -46,10 +51,34 @@ async function readBody(r: Response) {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > 5 * 1024 * 1024) throw new Error("Oversized body");
-      body += decoder.decode(value, { stream: true });
+      if (size > 5 * 1024 * 1024)
+        throw new SubscriptionError(
+          "UPSTREAM_TOO_LARGE",
+          "Upstream body exceeds 5 MiB.",
+        );
+      try {
+        body += decoder.decode(value, { stream: true });
+      } catch {
+        throw new SubscriptionError(
+          "UPSTREAM_ENCODING",
+          "Upstream body is not valid UTF-8.",
+        );
+      }
     }
-    return body + decoder.decode();
+    try {
+      body += decoder.decode();
+    } catch {
+      throw new SubscriptionError(
+        "UPSTREAM_ENCODING",
+        "Upstream body is not valid UTF-8.",
+      );
+    }
+    if (!body.trim())
+      throw new SubscriptionError(
+        "UPSTREAM_EMPTY",
+        "Upstream returned an empty body.",
+      );
+    return body;
   } finally {
     await reader.cancel().catch(() => {});
   }
@@ -67,9 +96,18 @@ export async function handleRequest(request: Request, env: Env) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);
   try {
-    const url = new URL(env.UPSTREAM_URL);
-    if (url.protocol !== "https:" || url.username || url.password)
-      throw new Error("Invalid upstream");
+    let url: URL;
+    try {
+      url = new URL(env.UPSTREAM_URL);
+      if (url.protocol !== "https:" || url.username || url.password)
+        throw new Error();
+    } catch {
+      throw new SubscriptionError(
+        "INVALID_UPSTREAM_URL",
+        "UPSTREAM_URL must be an HTTPS URL without embedded credentials.",
+        503,
+      );
+    }
     const upstream = await fetch(url, {
       headers: {
         accept: "application/json, application/yaml, text/yaml, */*",
@@ -78,15 +116,38 @@ export async function handleRequest(request: Request, env: Env) {
           request.headers.get("user-agent") ||
           "sing-box/1.14.0",
       },
-      redirect: "error",
+      redirect: "manual",
       signal: controller.signal,
     });
-    if (!upstream.ok) throw new Error("Upstream failed");
+    if (upstream.status >= 300 && upstream.status < 400)
+      throw new SubscriptionError(
+        "UPSTREAM_REDIRECT",
+        "Upstream returned a redirect. Set UPSTREAM_URL to the final subscription URL.",
+      );
+    if (!upstream.ok)
+      throw new SubscriptionError(
+        "UPSTREAM_HTTP_ERROR",
+        `Upstream returned HTTP ${upstream.status}.`,
+      );
     const result = transform(await readBody(upstream));
     return reply(result.body, 200, { "content-type": result.contentType });
-  } catch {
+  } catch (error) {
     // Fetch and parser errors can contain credentials. Do not log or expose them.
-    return reply("Subscription fetch or patch failed", 502);
+    const failure = controller.signal.aborted
+      ? new SubscriptionError(
+          "UPSTREAM_TIMEOUT",
+          "Upstream request exceeded 20 seconds.",
+          504,
+        )
+      : error instanceof SubscriptionError
+        ? error
+        : new SubscriptionError(
+            "UPSTREAM_FETCH_FAILED",
+            "Could not fetch or read upstream. Check upstream availability and network access.",
+          );
+    return reply(`${failure.code}: ${failure.message}`, failure.status, {
+      "x-error-code": failure.code,
+    });
   } finally {
     clearTimeout(timer);
   }
