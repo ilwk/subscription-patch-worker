@@ -1,0 +1,13 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "subscription-patch-worker",
+  "main": "src/index.ts",
+  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_date": "2026-09-09",
+  "vars": {
+    "EXCLUDE_CIDRS": "10.0.0.0/8",
+  },
+  "secrets": {
+    "required": ["UPSTREAM_URL", "ACCESS_TOKEN"],
+  },
+}
