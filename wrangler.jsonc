@@ -4,9 +4,7 @@
   "main": "src/index.ts",
   "compatibility_flags": ["nodejs_compat"],
   "compatibility_date": "2026-09-09",
-  "vars": {
-    "EXCLUDE_CIDRS": "10.0.0.0/8",
-  },
+  "rules": [{ "type": "Text", "globs": ["**/*.yaml"], "fallthrough": true }],
   "secrets": {
     "required": ["UPSTREAM_URL", "ACCESS_TOKEN"],
   },

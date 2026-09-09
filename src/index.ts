@@ -1,9 +1,7 @@
-import { isIP } from "node:net";
 import { transform } from "./adapters";
 export interface Env {
   UPSTREAM_URL: string;
   ACCESS_TOKEN: string;
-  EXCLUDE_CIDRS?: string;
   UPSTREAM_USER_AGENT?: string;
 }
 function reply(
@@ -27,10 +25,7 @@ async function authorized(request: Request, env: Env) {
     if (tokens.length !== 1 || !tokens[0]) return false;
     const hash = (s: string) =>
       crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
-    const [a, b] = await Promise.all([
-      hash(tokens[0]),
-      hash(env.ACCESS_TOKEN),
-    ]);
+    const [a, b] = await Promise.all([hash(tokens[0]), hash(env.ACCESS_TOKEN)]);
     let diff = 0;
     const x = new Uint8Array(a),
       y = new Uint8Array(b);
@@ -39,27 +34,6 @@ async function authorized(request: Request, env: Env) {
   } catch {
     return false;
   }
-}
-function cidrs(value = "10.0.0.0/8") {
-  const list = value
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (
-    !list.length ||
-    list.some((c) => {
-      const [ip, prefix, extra] = c.split("/");
-      const version = isIP(ip);
-      return (
-        extra !== undefined ||
-        !version ||
-        !/^\d+$/.test(prefix ?? "") ||
-        Number(prefix) > (version === 4 ? 32 : 128)
-      );
-    })
-  )
-    throw new Error("Invalid CIDRs");
-  return [...new Set(list)];
 }
 async function readBody(r: Response) {
   if (!r.body) throw new Error("Empty body");
@@ -93,7 +67,6 @@ export async function handleRequest(request: Request, env: Env) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);
   try {
-    const excludes = cidrs(env.EXCLUDE_CIDRS);
     const url = new URL(env.UPSTREAM_URL);
     if (url.protocol !== "https:" || url.username || url.password)
       throw new Error("Invalid upstream");
@@ -109,7 +82,7 @@ export async function handleRequest(request: Request, env: Env) {
       signal: controller.signal,
     });
     if (!upstream.ok) throw new Error("Upstream failed");
-    const result = transform(await readBody(upstream), excludes);
+    const result = transform(await readBody(upstream));
     return reply(result.body, 200, { "content-type": result.contentType });
   } catch {
     // Fetch and parser errors can contain credentials. Do not log or expose them.

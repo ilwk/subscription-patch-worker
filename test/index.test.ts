@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { parse } from "yaml";
 import { transform } from "../src/adapters";
+import { mergeConfig } from "../src/merge";
 import { handleRequest, type Env } from "../src/index";
 const env: Env = {
   UPSTREAM_URL: "https://example.com/sub",
@@ -9,56 +10,122 @@ const env: Env = {
 };
 const request = (token = "secret") =>
   new Request("https://worker.test/config?token=" + encodeURIComponent(token), {
-    headers: {
-      "user-agent": "sing-box/1.14.0",
-    },
+    headers: { "user-agent": "sing-box/1.14.0" },
   });
-test("sing-box preserves fields and patches every TUN idempotently", () => {
-  const c = {
-    inbounds: [
-      { type: "tun", route_exclude_address: ["192.168.0.0/16"] },
-      { type: "tun" },
-      { type: "mixed" },
-    ],
-    outbounds: [{ type: "vless", uuid: "fixture" }],
-    route: { final: "proxy" },
+test("empty overrides preserve upstream bytes and do not require TUN", () => {
+  for (const body of [
+    '{ "outbounds": [] }',
+    "# preserve this comment\nproxies: []\n",
+  ]) {
+    assert.equal(transform(body).body, body);
+  }
+});
+test("objects merge recursively; arrays replace; scalars and null override", () => {
+  const base = {
+    dns: { enable: true, nameservers: ["old"] },
+    rules: ["old"],
+    value: 1,
   };
-  const result = transform(JSON.stringify(c), ["10.0.0.0/8"]);
-  assert.equal(transform(result.body, ["10.0.0.0/8"]).body, result.body);
-  const output = JSON.parse(result.body);
-  assert.deepEqual(output.outbounds, c.outbounds);
-  assert.deepEqual(output.route, c.route);
-  assert.deepEqual(output.inbounds[0].route_exclude_address, [
-    "192.168.0.0/16",
-    "10.0.0.0/8",
+  const patch = { dns: { nameservers: ["new"] }, rules: [], value: null };
+  assert.deepEqual(mergeConfig(base, patch, "mihomo"), {
+    dns: { enable: true, nameservers: ["new"] },
+    rules: [],
+    value: null,
+  });
+  assert.deepEqual(base.dns.nameservers, ["old"]);
+  assert.deepEqual(patch.rules, []);
+});
+test("sing-box matches tags, retains order and credentials, appends new entries", () => {
+  const base = {
+    inbounds: [{ type: "tun", tag: "tun-in", mtu: 9000 }, { type: "mixed" }],
+    outbounds: [{ type: "vless", tag: "node", uuid: "fixture" }],
+    route: { rules: [{ action: "sniff" }], final: "node" },
+  };
+  const patch = {
+    inbounds: [
+      { tag: "tun-in", mtu: 1500 },
+      { type: "mixed", tag: "new" },
+    ],
+    outbounds: [{ tag: "node", tls: { enabled: true } }],
+  };
+  const result = mergeConfig(base, patch, "sing-box");
+  assert.deepEqual(result.inbounds, [
+    { type: "tun", tag: "tun-in", mtu: 1500 },
+    { type: "mixed" },
+    { type: "mixed", tag: "new" },
   ]);
-  assert.deepEqual(output.inbounds[1].route_exclude_address, ["10.0.0.0/8"]);
-  assert.deepEqual(output.inbounds[2], { type: "mixed" });
-});
-test("Mihomo YAML keeps nodes, DNS, rules and disabled TUN", () => {
-  const input =
-    "proxies: []\nrules: [MATCH,DIRECT]\ndns: {enable: true}\ntun:\n  enable: false\n  route-exclude-address: [192.168.0.0/16]\n";
-  const output = parse(transform(input, ["10.0.0.0/8"]).body);
-  assert.equal(output.tun.enable, false);
-  assert.deepEqual(output.tun["route-exclude-address"], [
-    "192.168.0.0/16",
-    "10.0.0.0/8",
+  assert.deepEqual(result.outbounds, [
+    { type: "vless", tag: "node", uuid: "fixture", tls: { enabled: true } },
   ]);
-  assert.deepEqual(output.dns, { enable: true });
+  assert.deepEqual(result.route, base.route);
+  assert.deepEqual(mergeConfig(result, patch, "sing-box"), result);
+  assert.equal(base.inbounds[0].mtu, 9000);
 });
-test("Mihomo missing TUN adds options without enabling it; JSON supported", () => {
-  const c = JSON.parse(transform('{"proxies":[]}', ["10.0.0.0/8"]).body);
-  assert.deepEqual(c.tun, { "route-exclude-address": ["10.0.0.0/8"] });
+test("ordinary nested arrays replace rather than tag merge; explicit [] clears", () => {
+  const base = {
+    outbounds: [{ type: "selector", tag: "select", outbounds: ["one", "two"] }],
+  };
+  assert.deepEqual(
+    mergeConfig(
+      base,
+      { outbounds: [{ tag: "select", outbounds: ["three"] }] },
+      "sing-box",
+    ),
+    { outbounds: [{ type: "selector", tag: "select", outbounds: ["three"] }] },
+  );
+  assert.deepEqual(mergeConfig(base, { outbounds: [] }, "sing-box"), {
+    outbounds: [],
+  });
 });
-test("rejects unsupported, duplicate YAML keys, missing TUN and malformed exclusions", () => {
-  for (const input of [
+test("missing or duplicate override tags and incomplete additions fail", () => {
+  const base = { inbounds: [{ type: "tun", tag: "tun-in" }] };
+  for (const entries of [
+    [{ mtu: 1500 }],
+    [{ tag: "typo" }],
+    [{ tag: "tun-in" }, { tag: "tun-in" }],
+  ]) {
+    assert.throws(() => mergeConfig(base, { inbounds: entries }, "sing-box"));
+  }
+});
+test("Mihomo chooses YAML override, keeps DNS siblings, replaces rules in order", () => {
+  const body =
+    "proxies: []\ndns: {enable: true, nameserver: [old]}\nrules: ['MATCH,DIRECT']\n";
+  const overrides = {
+    "sing-box": { log: { level: "debug" } },
+    mihomo: parse(
+      "dns:\n  nameserver: [new]\nrules:\n  - DOMAIN,example.com,DIRECT\n  - MATCH,PROXY\n",
+    ),
+  };
+  const result = transform(body, overrides);
+  assert.match(result.contentType, /yaml/);
+  assert.deepEqual(parse(result.body), {
+    proxies: [],
+    dns: { enable: true, nameserver: ["new"] },
+    rules: ["DOMAIN,example.com,DIRECT", "MATCH,PROXY"],
+  });
+});
+test("sing-box chooses JSON override independently", () => {
+  const result = transform('{"inbounds":[]}', {
+    "sing-box": { log: { level: "debug" } },
+    mihomo: { mode: "global" },
+  });
+  assert.deepEqual(JSON.parse(result.body), {
+    inbounds: [],
+    log: { level: "debug" },
+  });
+});
+test("rejects invalid, ambiguous and dangerous configuration", () => {
+  for (const body of [
     "{}",
     "hello",
     "tun: {}\ntun: {}",
-    '{"inbounds":[]}',
-    '{"tun":{"route-exclude-address":"bad"}}',
+    '{"inbounds":[],"proxies":[]}',
   ])
-    assert.throws(() => transform(input, ["10.0.0.0/8"]));
+    assert.throws(() => transform(body));
+  assert.throws(() =>
+    mergeConfig({}, JSON.parse('{"__proto__":{"polluted":true}}'), "mihomo"),
+  );
+  assert.throws(() => mergeConfig({}, [], "mihomo"));
 });
 test("unauthorized requests never fetch upstream", async (t) => {
   const fetchMock = t.mock.method(globalThis, "fetch", async () => {
@@ -66,7 +133,15 @@ test("unauthorized requests never fetch upstream", async (t) => {
   });
   assert.equal((await handleRequest(request("wrong"), env)).status, 401);
   assert.equal((await handleRequest(request(""), env)).status, 401);
-  assert.equal((await handleRequest(new Request("https://worker.test/config?token=secret&token=secret"), env)).status, 401);
+  assert.equal(
+    (
+      await handleRequest(
+        new Request("https://worker.test/config?token=secret&token=secret"),
+        env,
+      )
+    ).status,
+    401,
+  );
   assert.equal(
     (await handleRequest(new Request("https://worker.test/config"), env))
       .status,
@@ -89,9 +164,7 @@ test("authenticated request preserves UA and never forwards credentials", async 
   const r = await handleRequest(request(), env);
   assert.equal(r.status, 200);
   assert.equal(r.headers.get("cache-control"), "no-store");
-  assert.deepEqual((await r.json()).inbounds[0].route_exclude_address, [
-    "10.0.0.0/8",
-  ]);
+  assert.deepEqual(await r.json(), { inbounds: [{ type: "tun" }] });
 });
 test("upstream and parser failures do not leak credentials", async (t) => {
   t.mock.method(globalThis, "fetch", async () => {
@@ -100,11 +173,4 @@ test("upstream and parser failures do not leak credentials", async (t) => {
   const r = await handleRequest(request(), env);
   assert.equal(r.status, 502);
   assert.doesNotMatch(await r.text(), /private-token/);
-});
-test("invalid configured CIDR fails closed", async () => {
-  assert.equal(
-    (await handleRequest(request(), { ...env, EXCLUDE_CIDRS: "10.0.0.0/999" }))
-      .status,
-    502,
-  );
 });

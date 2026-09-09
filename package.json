@@ -3,10 +3,14 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
-    "test": "tsx --test test/*.test.ts",
+    "test": "esbuild test/index.test.ts --bundle --platform=node --format=esm --packages=external --loader:.yaml=text --outfile=.wrangler/test.mjs && node --test .wrangler/test.mjs",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm test",
+    "check": "pnpm typecheck && pnpm test",
     "build": "wrangler deploy --dry-run",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
@@ -16,11 +20,8 @@
   },
   "devDependencies": {
     "typescript": "7.0.2",
-    "tsx": "4.23.13",
+    "esbuild": "0.28.1",
     "@types/node": "^24.0.0",
     "wrangler": "4.130.0"
-  },
-  "overrides": {
-    "sharp": "0.35.4"
   }
 }

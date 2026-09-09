@@ -1,53 +1,50 @@
 import { parseDocument, stringify } from "yaml";
-type Config = Record<string, unknown>;
-function object(x: unknown): x is Config {
-  return x !== null && typeof x === "object" && !Array.isArray(x);
+import singBoxOverride from "../overrides/sing-box.json";
+import mihomoOverride from "../overrides/mihomo.yaml";
+import { isObject, mergeConfig } from "./merge";
+
+export interface Overrides {
+  "sing-box": unknown;
+  mihomo: unknown;
 }
-function merge(c: Config, key: string, cidrs: string[]) {
-  const old = c[key] ?? [];
-  if (!Array.isArray(old) || old.some((x) => typeof x !== "string"))
-    throw new Error("Invalid exclusions");
-  c[key] = [...new Set([...old, ...cidrs])];
+function parseYaml(source: string): unknown {
+  const doc = parseDocument(source, { uniqueKeys: true });
+  if (doc.errors.length || doc.warnings.length) throw new Error("Invalid YAML");
+  return doc.toJS({ maxAliasCount: 50 });
 }
-const adapters = [
-  {
-    matches: (c: Config) => Array.isArray(c.inbounds),
-    patch(c: Config, cidrs: string[]) {
-      const tuns = (c.inbounds as unknown[]).filter(
-        (x): x is Config => object(x) && x.type === "tun",
-      );
-      if (!tuns.length) throw new Error("No TUN");
-      for (const tun of tuns) merge(tun, "route_exclude_address", cidrs);
-    },
-  },
-  {
-    matches: (c: Config) =>
-      "tun" in c || "proxies" in c || "proxy-providers" in c,
-    patch(c: Config, cidrs: string[]) {
-      if (c.tun === undefined) c.tun = {};
-      if (!object(c.tun)) throw new Error("Invalid TUN");
-      merge(c.tun, "route-exclude-address", cidrs);
-    },
-  },
-];
-export function transform(body: string, cidrs: string[]) {
-  let c: unknown,
+const defaults: Overrides = {
+  "sing-box": singBoxOverride,
+  mihomo: parseYaml(mihomoOverride) ?? {},
+};
+export function transform(body: string, overrides: Overrides = defaults) {
+  let config: unknown,
     json = true;
   try {
-    c = JSON.parse(body);
+    config = JSON.parse(body);
   } catch {
     json = false;
-    const doc = parseDocument(body, { uniqueKeys: true });
-    if (doc.errors.length || doc.warnings.length)
-      throw new Error("Invalid YAML");
-    c = doc.toJS({ maxAliasCount: 50 });
+    config = parseYaml(body);
   }
-  if (!object(c)) throw new Error("Expected configuration");
-  const adapter = adapters.find((a) => a.matches(c));
-  if (!adapter) throw new Error("Unsupported format");
-  adapter.patch(c, cidrs);
+  if (!isObject(config)) throw new Error("Expected configuration");
+  const singBox =
+    "inbounds" in config || "outbounds" in config || "endpoints" in config;
+  const mihomo =
+    "tun" in config ||
+    "proxies" in config ||
+    "proxy-providers" in config ||
+    "proxy-groups" in config;
+  if (singBox === mihomo) throw new Error("Unsupported or ambiguous format");
+  const format = singBox ? "sing-box" : "mihomo";
+  const override = overrides[format];
+  const result = mergeConfig(config, override, format);
   return {
-    body: json ? JSON.stringify(c) : stringify(c),
+    // An empty override is a true passthrough, including comments and whitespace.
+    body:
+      isObject(override) && Object.keys(override).length === 0
+        ? body
+        : json
+          ? JSON.stringify(result)
+          : stringify(result),
     contentType: json
       ? "application/json; charset=utf-8"
       : "application/yaml; charset=utf-8",
